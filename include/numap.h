@@ -1,9 +1,11 @@
+#ifndef NUMAP_H
+#define NUMAP_H
 #include <inttypes.h>
 #include <sys/types.h>
 #include <perfmon/pfmlib_perf_event.h>
 #include <signal.h>
 
-#define MAX_NB_NUMA_NODES     16
+#define MAX_NB_NUMA_NODES     64
 #define MAX_NB_THREADS        24
 #define MAX_NB_CPUS           32
 
@@ -16,8 +18,22 @@
 #define ERROR_NUMAP_WRITE_SAMPLING_ARCH_NOT_SUPPORTED -10
 #define ERROR_PFM                                     -11
 #define ERROR_READ                                    -12
+#define ERROR_NUMAP_NO_SAMPLING_PMU                   -13
 
+/* Memory access sampling backend. */
+enum numap_backend {
+  NUMAP_BACKEND_PEBS, /* Intel: libpfm4 event, records read from the perf ring */
+  NUMAP_BACKEND_IBS,  /* AMD: ibs_op PMU, records converted by numap */
+  NUMAP_BACKEND_SPE,  /* Arm: arm_spe PMU, AUX packets decoded by numap */
+};
+
+#if defined(__x86_64__) || defined(__i386__)
 #define rmb()		asm volatile("lfence" ::: "memory")
+#elif defined(__aarch64__)
+#define rmb()		asm volatile("dmb ishld" ::: "memory")
+#else
+#define rmb()		__sync_synchronize()
+#endif
 
 /**
  * Structure representing a measurement of counting the load of controlers.
@@ -57,6 +73,26 @@ struct numap_sampling_measure {
   void (*handler)(struct numap_sampling_measure*, int); // handler called each nb_refresh samples
   int total_samples; // after record, contains the total number of samples % nb_refresh
   int nb_refresh; // default value : 1000
+
+  /*
+   * IBS and SPE backends. The kernel buffers (perf ring, and AUX area for
+   * SPE) are private; metadata_pages_per_tid then points to a ring that
+   * numap fills with PERF_RECORD_SAMPLE records in the layout given by
+   * sample_type, so that readers of metadata_pages_per_tid work unchanged.
+   * One hardware event samples loads and stores: stores go to the partner
+   * measure (the write measure started on the same thread).
+   */
+  int backend;
+  uint64_t sample_type;
+  struct perf_event_mmap_page *kernel_pages_per_tid[MAX_NB_THREADS];
+  void *aux_per_tid[MAX_NB_THREADS];
+  size_t aux_len;
+  size_t ring_len;
+  struct numap_sampling_measure *partner;
+  char is_partner;
+  uint64_t nb_samples;     // samples written to the ring
+  uint64_t nb_dropped;     // samples dropped because the ring was full
+  uint64_t nb_skipped;     // records that were neither loads nor stores
 };
 
 /**
@@ -89,6 +125,8 @@ char* concat(const char *s1, const char *s2);
  * Numap initialization function
  */
 int numap_init(void);
+int numap_backend(void);
+const char *numap_backend_name(void);
 
 /**
  * Memory counting.
@@ -134,3 +172,4 @@ int is_served_by_remote_memory(union perf_mem_data_src data_src);
 int is_served_by_local_NA_miss(union perf_mem_data_src data_src);
 char *get_data_src_opcode(union perf_mem_data_src data_src);
 char *get_data_src_level(union perf_mem_data_src data_src);
+#endif

@@ -19,6 +19,7 @@
 #include <pthread.h>
 
 #include "numap.h"
+#include "numap_conv.h"
 
 #define PERF_EVENT_MLOCK_KB_FILE "/proc/sys/kernel/perf_event_mlock_kb"
 
@@ -279,6 +280,23 @@ unsigned int perf_event_mlock_kb;
 struct archi *current_archi;
 char *model_name = NULL;
 int curr_err;
+int current_backend = NUMAP_BACKEND_PEBS;
+
+static int uses_conv(void) {
+  return current_backend != NUMAP_BACKEND_PEBS;
+}
+
+int numap_backend(void) {
+  return current_backend;
+}
+
+const char *numap_backend_name(void) {
+  switch (current_backend) {
+  case NUMAP_BACKEND_IBS: return "AMD IBS";
+  case NUMAP_BACKEND_SPE: return "Arm SPE";
+  default: return "Intel PEBS";
+  }
+}
 
 struct link_fd_measure {
   struct link_fd_measure *next;
@@ -309,8 +327,12 @@ __attribute__((constructor)) void init(void) {
   const char *family_string = "cpu family\t";
   const char *model_string = "model\t";
   const char *model_name_string = "model name\t";
+  const char *vendor_string = "vendor_id\t";
+  int is_amd = 0;
   while(getline(&arg, &size, cpuinfo) != -1 && (!family || !model || !model_name)) {
-    if (strncmp(family_string, arg, strlen(family_string)) == 0) {
+    if (strncmp(vendor_string, arg, strlen(vendor_string)) == 0) {
+      is_amd = strstr(arg, "AuthenticAMD") != NULL;
+    } else if (strncmp(family_string, arg, strlen(family_string)) == 0) {
       strtok(arg, ":");
       family = atoi(strtok(NULL, "\n"));
     } else if (strncmp(model_string, arg, strlen(model_string)) == 0) {
@@ -326,8 +348,13 @@ __attribute__((constructor)) void init(void) {
   }
   free(arg);
   fclose(cpuinfo);
+  if (!model_name)
+    model_name = strdup("unknown");
   current_archi = malloc(sizeof(struct archi));
   get_archi(CPU_MODEL(family, model), current_archi);
+  current_backend = conv_detect_backend(is_amd);
+  if (uses_conv())
+    snprintf(current_archi->name, 256, "%s", numap_backend_name());
 
   // Get numa configuration
   int available = numa_available();
@@ -335,13 +362,15 @@ __attribute__((constructor)) void init(void) {
     nb_numa_nodes = -1;
   } else {
     nb_numa_nodes = numa_num_configured_nodes();
+    if (nb_numa_nodes > MAX_NB_NUMA_NODES)
+      nb_numa_nodes = MAX_NB_NUMA_NODES;
     int nb_cpus = numa_num_configured_cpus();
     for (node = 0; node < nb_numa_nodes; node++) {
       struct bitmask *mask = numa_allocate_cpumask();
       numa_node_to_cpus(node, mask);
       numa_node_to_cpu[node] = -1;
       for (cpu = 0; cpu < nb_cpus; cpu++) {
-        if (*(mask->maskp) & (1 << cpu)) {
+        if (numa_bitmask_isbitset(mask, cpu)) {
           numa_node_to_cpu[node] = cpu;
           break;
         }
@@ -405,6 +434,8 @@ const char *numap_error_message(int error) {
     return build_string("libnumap: error when initializing pfm: %s", pfm_strerror(curr_err));
   case ERROR_READ:
     return "libnumap: error while trying to read counter";
+  case ERROR_NUMAP_NO_SAMPLING_PMU:
+    return "libnumap: no ibs_op or arm_spe PMU in /sys/bus/event_source/devices";
   default:
     return "libnumap: unknown error";
   }
@@ -611,7 +642,12 @@ int numap_sampling_init_measure(struct numap_sampling_measure *measure, int nb_t
   for (thread = 0; thread < measure->nb_threads; thread++) {
     measure->fd_per_tid[thread] = 0;
     measure->metadata_pages_per_tid[thread] = 0;
+    measure->kernel_pages_per_tid[thread] = 0;
+    measure->aux_per_tid[thread] = 0;
   }
+  measure->backend = current_backend;
+  measure->partner = NULL;
+  measure->is_partner = 0;
   measure->handler = NULL;
   measure->total_samples = 0;
   set_signal_handler(refresh_wrapper_handler);
@@ -644,6 +680,10 @@ int numap_sampling_resume(struct numap_sampling_measure *measure) {
     measure->started++;
   }
 
+  if (measure->backend != NUMAP_BACKEND_PEBS) {
+    conv_sampling_enable(measure);
+    return 0;
+  }
   return __numap_sampling_resume(measure);
 }
 
@@ -705,6 +745,8 @@ int __numap_sampling_start(struct numap_sampling_measure *measure, struct perf_e
 
 int numap_sampling_read_supported() {
 
+  if (uses_conv())
+    return 1;
   if (strcmp(current_archi->sampling_read_event, NOT_SUPPORTED) == 0) {
     return 0;
   }
@@ -717,7 +759,18 @@ int numap_sampling_read_start_generic(struct numap_sampling_measure *measure, ui
   if (!numap_sampling_read_supported()) {
     return ERROR_NUMAP_READ_SAMPLING_ARCH_NOT_SUPPORTED;
   }
-  
+
+  if (uses_conv()) {
+    if (measure->started != 0)
+      return ERROR_NUMAP_ALREADY_STARTED;
+    measure->started++;
+    int err = conv_sampling_start(measure, sample_type);
+    if (err)
+      return err;
+    conv_sampling_enable(measure);
+    return 0;
+  }
+
   // Set attribute parameter for perf_event_open using pfmlib
   struct perf_event_attr pe_attr;
   memset(&pe_attr, 0, sizeof(pe_attr));
@@ -767,6 +820,10 @@ int numap_sampling_read_stop(struct numap_sampling_measure *measure) {
   } else {
     measure->started = 0;
   }
+  if (measure->backend != NUMAP_BACKEND_PEBS) {
+    conv_sampling_disable(measure);
+    return 0;
+  }
   int thread;
   for (thread = 0; thread < measure->nb_threads; thread++) {
     ioctl(measure->fd_per_tid[thread], PERF_EVENT_IOC_DISABLE, 0);
@@ -776,6 +833,8 @@ int numap_sampling_read_stop(struct numap_sampling_measure *measure) {
 
 int numap_sampling_write_supported() {
 
+  if (uses_conv())
+    return 1;
   if (strcmp(current_archi->sampling_write_event, NOT_SUPPORTED) == 0) {
     return 0;
   }
@@ -786,6 +845,13 @@ int numap_sampling_write_start_generic(struct numap_sampling_measure *measure, u
   // Checks that write sampling is supported before calling pfm
   if (!numap_sampling_write_supported()) {
     return ERROR_NUMAP_WRITE_SAMPLING_ARCH_NOT_SUPPORTED;
+  }
+
+  if (uses_conv()) {
+    if (measure->started != 0)
+      return ERROR_NUMAP_ALREADY_STARTED;
+    measure->started++;
+    return conv_sampling_start_partner(measure, sample_type);
   }
 
   // Set attribute parameter for perf_event_open using pfmlib
@@ -829,6 +895,11 @@ int numap_sampling_write_stop(struct numap_sampling_measure *measure) {
 
 int numap_sampling_end(struct numap_sampling_measure *measure) {
   int thread;
+
+  if (measure->backend != NUMAP_BACKEND_PEBS) {
+    conv_sampling_end(measure);
+    return 0;
+  }
 
   struct link_fd_measure* current_lfm;
   while (link_fd_measure != NULL) {
