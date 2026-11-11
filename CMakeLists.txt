@@ -14,6 +14,9 @@ SET(PKG_CONFIG_INCLUDEDIR  "\${prefix}/include"  )
 SET(PKG_CONFIG_LIBS  "-L\${libdir} -lnumap"  )
 SET(PKG_CONFIG_CFLAGS  "-I\${includedir}"  )
 
+# numap is loaded with NumaMMA's preloaded malloc: keep TLS out of __tls_get_addr.
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -ftls-model=initial-exec")
+
 find_package (pfm)
 if (PFM_FOUND)
   set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -I${PFM_INCLUDE_DIR}")
