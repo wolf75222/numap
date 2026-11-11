@@ -29,9 +29,37 @@ library is to provide high level abstraction for:
 - Knights Mill (06_133)
 - Knights Landing (06_87)
 
-### AMD processors
+### AMD processors (IBS)
 
- - On going development
+The `ibs_op` PMU samples loads and stores. numap decodes the IBS registers
+(`PERF_SAMPLE_RAW`) and keeps the samples that carry a data address. The
+kernel rejects `ibs_op` events that exclude the kernel, so IBS needs
+`perf_event_paranoid <= 1` or `CAP_PERFMON`. With `perf_event_paranoid = 2`
+`perf_event_open` fails with `EACCES` (tested on EPYC 9654, kernel 5.14 of
+RHEL 9.6).
+
+### Arm processors (SPE)
+
+The `arm_spe` PMU writes packets in the AUX area; numap decodes them (data
+virtual address, total latency, operation type, data source) when sampling
+is stopped. SPE works per thread without privilege. Tested on Grace
+(Neoverse V2, kernel 5.14 of RHEL 9.6, 64 KB pages).
+
+### How the IBS and SPE backends work
+
+One hardware event per thread samples loads and stores. numap writes the
+decoded samples as `PERF_RECORD_SAMPLE` records, in the layout requested by
+`sample_type`, into a private ring whose header is a `perf_event_mmap_page`.
+`metadata_pages_per_tid` points to that ring, so code that reads perf rings
+works unchanged. Stores go to the write measure started on the same thread.
+Samples are decoded when the measure is stopped (`numap_sampling_read_stop`);
+the overflow handler set by `numap_sampling_set_measure_handler` is not
+called for these backends.
+
+The backend is chosen at start-up: SPE if an `arm_spe_*` PMU exists, IBS on
+AMD if `ibs_op` exists, PEBS otherwise. `NUMAP_BACKEND=pebs|ibs|spe` forces
+it, `NUMAP_AUX_KB` sets the SPE AUX buffer size (default 4096 KB), and
+`NUMAP_VERBOSE=1` prints the sample counts of each measure at the end.
 
 ## Folders Organization
 
