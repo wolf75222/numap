@@ -1,6 +1,7 @@
 add_library(numap SHARED
   numap.c
   numap_analyse.c
+  numap_conv.c
   )
 target_link_libraries(numap LINK_PUBLIC numa pfm)
 
